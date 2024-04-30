@@ -4,6 +4,7 @@
 #include <map>
 #include <set>
 #include <cassert>
+#include "asmjit/core/emitter.h"
 #include "asmjit_test_stress_x86_data.h"
 
 using namespace asmjit;
@@ -908,13 +909,12 @@ JittedFunction jit_compile_script(script_data *script)
 	// MyErrorHandler myErrorHandler;
 	// code.setErrorHandler(&myErrorHandler);
 
-	StringLogger logger;
-	if (DEBUG_JIT_PRINT_ASM)
-	{
-		code.setLogger(&logger);
-	}
+	FileLogger logger(stdout);
+	// logger.setIndentation(FormatIndentationGroup::kCode, 2);
+	code.setLogger(&logger);
 
 	x86::Compiler cc(&code);
+	cc.addDiagnosticOptions(asmjit::_abi_1_13::DiagnosticOptions::kRADebugAssignment);
 
 	// Setup parameters.
 	cc.addFunc(FuncSignatureT<int32_t, int32_t *, int32_t *, int32_t *, uint16_t *, uint32_t *, intptr_t *, uint32_t *, uint32_t *>(state.calling_convention));

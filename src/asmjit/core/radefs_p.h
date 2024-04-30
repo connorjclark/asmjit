@@ -15,6 +15,7 @@
 #include "../core/type.h"
 #include "../core/zone.h"
 #include "../core/zonevector.h"
+#include <cstdint>
 
 ASMJIT_BEGIN_NAMESPACE
 
@@ -1085,6 +1086,9 @@ public:
   //! have immediate consecutive registers as well, except the last one.
   ZoneBitVector _immediateConsecutives {};
 
+  //! Block ID of .
+  uint32_t _singleBlockId = kIdNone;
+
   //! \}
 
   //! \name Construction & Destruction
@@ -1200,6 +1204,10 @@ public:
     _immediateConsecutives.setBit(workId, true);
     return kErrorOk;
   }
+
+  ASMJIT_INLINE_NODEBUG bool isUsedBySingleBlock() const noexcept { return _singleBlockId != kIdNone; }
+  ASMJIT_INLINE_NODEBUG uint32_t getSingleBlockId() const noexcept { return _singleBlockId; }
+  ASMJIT_INLINE_NODEBUG void setSingleBlockId(uint32_t blockId) noexcept { _singleBlockId = blockId; }
 
   //! \}
 };

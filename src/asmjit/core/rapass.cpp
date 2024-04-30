@@ -13,6 +13,9 @@
 #include "../core/type.h"
 #include "../core/zonestack.h"
 
+#include <vector>
+#include <map>
+
 ASMJIT_BEGIN_NAMESPACE
 
 // RABlock - Control Flow
@@ -984,11 +987,25 @@ ASMJIT_FAVOR_SPEED Error BaseRAPass::buildLiveness() noexcept {
     RALiveCount maxLiveCount;
 
     // Process LIVE-IN.
-    ZoneBitVector::ForEachBitSet it(block->liveIn());
-    while (it.hasNext()) {
-      RAWorkReg* workReg = _workRegs[uint32_t(it.next())];
-      curLiveCount[workReg->group()]++;
-      ASMJIT_PROPAGATE(workReg->liveSpans().openAt(allocator(), position, endPosition));
+    {
+      ZoneBitVector::ForEachBitSet it(block->liveIn());
+      while (it.hasNext()) {
+        RAWorkReg* workReg = _workRegs[uint32_t(it.next())];
+        curLiveCount[workReg->group()]++;
+        ASMJIT_PROPAGATE(workReg->liveSpans().openAt(allocator(), position, endPosition));
+      }
+	  }
+
+    // Mark registers that exist only in a single block.
+    {
+      ZoneBitVector::ForEachBitSet it(block->gen());
+      while (it.hasNext()) {
+        uint32_t id = uint32_t(it.next());
+        if (block->kill().bitAt(id)) {
+          RAWorkReg* workReg = _workRegs[id];
+          workReg->setSingleBlockId(block->blockId());
+        }
+      }
     }
 
     for (;;) {
@@ -1345,6 +1362,62 @@ ASMJIT_FAVOR_SPEED Error BaseRAPass::binPack(RegGroup group) noexcept {
     }
   }
 
+
+  logger->log("....3\n");
+
+  // std::map<uint32_t, RegMask> blockIdReservedPhysRegisters;
+
+  // Assign the registers used in a single block.
+  if (!workRegs.empty()) {
+    uint32_t dstIndex = 0;
+    uint32_t singlesCnt = 0;
+    std::map<uint32_t, std::vector<uint32_t>> blockIdToOwnedRegisters;
+
+    for (i = 0; i < numWorkRegs; i++) {
+      RAWorkReg* workReg = workRegs[i];
+
+      if (workReg->isAllocated())
+        continue;
+
+      if (workReg->isUsedBySingleBlock()) {
+        blockIdToOwnedRegisters[workReg->getSingleBlockId()].push_back(i);
+        singlesCnt++;
+        continue;
+      }
+
+      workRegs[dstIndex++] = workReg;
+    }
+    workRegs._setSize(dstIndex);
+    numWorkRegs = dstIndex;
+
+    for (auto& [blockId, regs] : blockIdToOwnedRegisters) {
+      RABlock* block = _blocks[blockId];
+      // logger->logf("block %d - %d regs \n", blockId, regs.size());
+
+      RegMask remainingPhysRegs = availableRegs;
+      RegMask physRegs = remainingPhysRegs & ~preservedRegs;
+      remainingPhysRegs &= preservedRegs;
+
+      LiveRegSpans blockSpan;
+      blockSpan.openAt(allocator(), block->firstPosition(), block->endPosition());
+
+      for (auto regId : regs) {
+        RAWorkReg* workReg = workRegs[i];
+
+        // if (remainingPhysRegs & workReg->preferredMask())
+        //   remainingPhysRegs &= workReg->preferredMask();
+
+        // LiveRegSpans& live = _globalLiveSpans[group][physId];
+
+        // ???
+      }
+    }
+
+    logger->logf("singles: %d / %d \n", singlesCnt, workRegs.size() + singlesCnt);
+  }
+
+  logger->log("....2\n");
+
   // Try to pack the rest.
   if (!workRegs.empty()) {
     uint32_t dstIndex = 0;
@@ -1407,17 +1480,19 @@ ASMJIT_FAVOR_SPEED Error BaseRAPass::binPack(RegGroup group) noexcept {
     numWorkRegs = dstIndex;
   }
 
-  ASMJIT_RA_LOG_COMPLEX({
-    for (uint32_t physId = 0; physId < physCount; physId++) {
-      LiveRegSpans& live = _globalLiveSpans[group][physId];
-      if (live.empty())
-        continue;
+  logger->log("....4\n");
 
-      sb.clear();
-      RAPass_dumpSpans(sb, physId, live);
-      logger->log(sb);
-    }
-  });
+//   ASMJIT_RA_LOG_COMPLEX({
+//     for (uint32_t physId = 0; physId < physCount; physId++) {
+//       LiveRegSpans& live = _globalLiveSpans[group][physId];
+//       if (live.empty())
+//         continue;
+
+//       sb.clear();
+//       RAPass_dumpSpans(sb, physId, live);
+//       logger->log(sb);
+//     }
+//   });
 
   // Maybe unused if logging is disabled.
   DebugUtils::unused(physCount);
@@ -1434,15 +1509,17 @@ ASMJIT_FAVOR_SPEED Error BaseRAPass::binPack(RegGroup group) noexcept {
       uint32_t count = workRegs.size();
       sb.clear();
       sb.appendFormat("  Unassigned (%u): ", count);
-      for (i = 0; i < numWorkRegs; i++) {
-        RAWorkReg* workReg = workRegs[i];
-        if (i) sb.append(", ");
-        sb.append(workReg->name());
-      }
+    //   for (i = 0; i < numWorkRegs; i++) {
+    //     RAWorkReg* workReg = workRegs[i];
+    //     if (i) sb.append(", ");
+    //     sb.append(workReg->name());
+    //   }
       sb.append('\n');
       logger->log(sb);
     });
   }
+
+  logger->log("....5\n");
 
   return kErrorOk;
 }
