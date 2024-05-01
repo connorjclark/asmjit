@@ -1262,7 +1262,7 @@ ASMJIT_FAVOR_SPEED Error BaseRAPass::linearScan(RegGroup group) noexcept {
   auto compareByEndWorkId = [&](uint32_t a, uint32_t b) noexcept {
     return reg_span_end[a] < reg_span_end[b];
   };
-  std::sort(workRegs.begin(), workRegs.end(), compareByEndWorkReg);
+  std::stable_sort(workRegs.begin(), workRegs.end(), compareByEndWorkReg);
 
   RegMask availableRegs = _availableRegs[group];
   RegMask preservedRegs = func()->frame().preservedRegs(group);
