@@ -1093,6 +1093,7 @@ public:
   //! Initializes data structures used for global live spans.
   Error initGlobalLiveSpans() noexcept;
 
+  Error linearScan(RegGroup group) noexcept;
   Error binPack(RegGroup group) noexcept;
 
   //! \}

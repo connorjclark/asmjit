@@ -15,6 +15,7 @@
 
 #include <vector>
 #include <map>
+#include <algorithm>
 
 ASMJIT_BEGIN_NAMESPACE
 
@@ -1180,7 +1181,9 @@ Error BaseRAPass::runGlobalAllocator() noexcept {
   ASMJIT_PROPAGATE(initGlobalLiveSpans());
 
   for (RegGroup group : RegGroupVirtValues{}) {
-    ASMJIT_PROPAGATE(binPack(group));
+    // TODO: should make this configurable.
+    // ASMJIT_PROPAGATE(binPack(group));
+    ASMJIT_PROPAGATE(linearScan(group));
   }
 
   return kErrorOk;
@@ -1210,6 +1213,128 @@ struct RAConsecutiveReg {
   RAWorkReg* workReg;
   RAWorkReg* parentReg;
 };
+
+// https://en.wikipedia.org/wiki/Register_allocation#Linear_scan
+// Fast compilation, but suboptimal runtime.
+ASMJIT_FAVOR_SPEED Error BaseRAPass::linearScan(RegGroup group) noexcept {
+  if (workRegCount(group) == 0)
+    return kErrorOk;
+
+#ifndef ASMJIT_NO_LOGGING
+  Logger* logger = getLoggerIf(DiagnosticOptions::kRADebugAssignment);
+  StringTmp<512> sb;
+
+  ASMJIT_RA_LOG_FORMAT("[BinPack] Available=%u (0x%08X) Count=%u RegGroup=%u\n",
+    Support::popcnt(_availableRegs[group]),
+    _availableRegs[group],
+    workRegCount(group),
+    uint32_t(group));
+#endif
+
+  // TODO: ZoneVector's sort is unusually slow when using to sort by end time. For now,
+  // avoid ZoneVector and usd std.
+  // RAWorkRegs workRegs;
+  // ASMJIT_PROPAGATE(workRegs.concat(allocator(), this->workRegs(group)));
+  RAWorkRegs& originalWorkRegs = this->workRegs(group);
+  std::vector<RAWorkReg*> workRegs(originalWorkRegs.begin(), originalWorkRegs.end());
+
+  uint32_t maxRegWorkId = 0;
+  for (auto reg : workRegs) {
+    maxRegWorkId = std::max(maxRegWorkId, reg->workId());
+  }
+
+  std::vector<uint32_t> reg_span_start;
+  std::vector<uint32_t> reg_span_end;
+  reg_span_start.resize(maxRegWorkId + 1);
+  reg_span_end.resize(maxRegWorkId + 1);
+  for (auto reg : workRegs) {
+    auto& spans = reg->liveSpans()._data;
+    if (spans.size() > 0) {
+      // Linear scan does not account for lifetime holes.
+      reg_span_start[reg->workId()] = spans[0].a;
+      reg_span_end[reg->workId()] = spans[spans.size() - 1].b;
+    }
+  }
+
+  auto compareByEndWorkReg = [&](const RAWorkReg* a, const RAWorkReg* b) noexcept {
+    return reg_span_end[a->workId()] < reg_span_end[b->workId()];
+  };
+  auto compareByEndWorkId = [&](uint32_t a, uint32_t b) noexcept {
+    return reg_span_end[a] < reg_span_end[b];
+  };
+  std::sort(workRegs.begin(), workRegs.end(), compareByEndWorkReg);
+
+  RegMask availableRegs = _availableRegs[group];
+  RegMask preservedRegs = func()->frame().preservedRegs(group);
+
+  std::vector<uint32_t> active;
+  RegMask freeRegs = availableRegs & ~preservedRegs;
+  uint32_t R = Support::popcnt(freeRegs);
+  uint32_t spilledCnt = 0;
+
+  uint32_t numWorkRegs = workRegs.size();
+  for (uint32_t i = 0; i < numWorkRegs; i++) {
+    // ExpireOldIntervals
+    //
+    // for each interval j in active, in order of increasing end point do
+    //     if endpoint[j] ≥ startpoint[i] then
+    //         return 
+    //     remove j from active
+    //     add register[j] to pool of free registers
+    uint32_t k = 0;
+    for (uint32_t j : active) {
+      if (reg_span_end[j] >= reg_span_start[i])
+        break;
+
+      k++;
+      freeRegs |= Support::bitMask(workRegs[j]->homeRegId());
+    }
+    active.erase(active.begin(), active.begin() + k);
+
+    // if length(active) = R then
+    //     SpillAtInterval(i)
+    // else
+    //     register[i] ← a register removed from pool of free registers
+    //     add i to active, sorted by increasing end point
+
+    if (active.size() == R) {
+      // SpillAtInterval
+      //
+      // spill ← last interval in active
+      // if endpoint[spill] > endpoint[i] then
+      //     register[i] ← register[spill]
+      //     location[spill] ← new stack location
+      //     remove spill from active
+      //     add i to active, sorted by increasing end point
+      // else
+      //     location[i] ← new stack location
+      uint32_t spill = active.back();
+      if (reg_span_end[spill] > reg_span_end[i]) {
+        workRegs[i]->setHomeRegId(workRegs[spill]->homeRegId());
+        workRegs[spill]->markStackPreferred();
+        workRegs[spill]->setHomeRegId(BaseReg::kIdBad);
+        active.pop_back();
+        active.insert(std::upper_bound(active.begin(), active.end(), i, compareByEndWorkId), i);
+      } else {
+        workRegs[i]->markStackPreferred();
+      }
+      spilledCnt += 1;
+    } else {
+      uint32_t physId = Support::bitSizeOf<RegMask>() - 1 - Support::clz(freeRegs);
+      workRegs[i]->setHomeRegId(physId);
+      active.insert(std::upper_bound(active.begin(), active.end(), i, compareByEndWorkId), i);
+    }
+  }
+
+  if (spilledCnt == 0) {
+    ASMJIT_RA_LOG_FORMAT("  Completed.\n");
+  } else {
+    ASMJIT_RA_LOG_FORMAT("  Completed (spilled %d of %d).\n", spilledCnt, numWorkRegs);
+    _strategy[group].setType(RAStrategyType::kComplex);
+  }
+
+  return kErrorOk;
+}
 
 ASMJIT_FAVOR_SPEED Error BaseRAPass::binPack(RegGroup group) noexcept {
   if (workRegCount(group) == 0)
@@ -1362,62 +1487,6 @@ ASMJIT_FAVOR_SPEED Error BaseRAPass::binPack(RegGroup group) noexcept {
     }
   }
 
-
-  logger->log("....3\n");
-
-  // std::map<uint32_t, RegMask> blockIdReservedPhysRegisters;
-
-  // Assign the registers used in a single block.
-  if (!workRegs.empty()) {
-    uint32_t dstIndex = 0;
-    uint32_t singlesCnt = 0;
-    std::map<uint32_t, std::vector<uint32_t>> blockIdToOwnedRegisters;
-
-    for (i = 0; i < numWorkRegs; i++) {
-      RAWorkReg* workReg = workRegs[i];
-
-      if (workReg->isAllocated())
-        continue;
-
-      if (workReg->isUsedBySingleBlock()) {
-        blockIdToOwnedRegisters[workReg->getSingleBlockId()].push_back(i);
-        singlesCnt++;
-        continue;
-      }
-
-      workRegs[dstIndex++] = workReg;
-    }
-    workRegs._setSize(dstIndex);
-    numWorkRegs = dstIndex;
-
-    for (auto& [blockId, regs] : blockIdToOwnedRegisters) {
-      RABlock* block = _blocks[blockId];
-      // logger->logf("block %d - %d regs \n", blockId, regs.size());
-
-      RegMask remainingPhysRegs = availableRegs;
-      RegMask physRegs = remainingPhysRegs & ~preservedRegs;
-      remainingPhysRegs &= preservedRegs;
-
-      LiveRegSpans blockSpan;
-      blockSpan.openAt(allocator(), block->firstPosition(), block->endPosition());
-
-      for (auto regId : regs) {
-        RAWorkReg* workReg = workRegs[i];
-
-        // if (remainingPhysRegs & workReg->preferredMask())
-        //   remainingPhysRegs &= workReg->preferredMask();
-
-        // LiveRegSpans& live = _globalLiveSpans[group][physId];
-
-        // ???
-      }
-    }
-
-    logger->logf("singles: %d / %d \n", singlesCnt, workRegs.size() + singlesCnt);
-  }
-
-  logger->log("....2\n");
-
   // Try to pack the rest.
   if (!workRegs.empty()) {
     uint32_t dstIndex = 0;
@@ -1480,19 +1549,17 @@ ASMJIT_FAVOR_SPEED Error BaseRAPass::binPack(RegGroup group) noexcept {
     numWorkRegs = dstIndex;
   }
 
-  logger->log("....4\n");
+  ASMJIT_RA_LOG_COMPLEX({
+    for (uint32_t physId = 0; physId < physCount; physId++) {
+      LiveRegSpans& live = _globalLiveSpans[group][physId];
+      if (live.empty())
+        continue;
 
-//   ASMJIT_RA_LOG_COMPLEX({
-//     for (uint32_t physId = 0; physId < physCount; physId++) {
-//       LiveRegSpans& live = _globalLiveSpans[group][physId];
-//       if (live.empty())
-//         continue;
-
-//       sb.clear();
-//       RAPass_dumpSpans(sb, physId, live);
-//       logger->log(sb);
-//     }
-//   });
+      sb.clear();
+      RAPass_dumpSpans(sb, physId, live);
+      logger->log(sb);
+    }
+  });
 
   // Maybe unused if logging is disabled.
   DebugUtils::unused(physCount);
@@ -1509,17 +1576,15 @@ ASMJIT_FAVOR_SPEED Error BaseRAPass::binPack(RegGroup group) noexcept {
       uint32_t count = workRegs.size();
       sb.clear();
       sb.appendFormat("  Unassigned (%u): ", count);
-    //   for (i = 0; i < numWorkRegs; i++) {
-    //     RAWorkReg* workReg = workRegs[i];
-    //     if (i) sb.append(", ");
-    //     sb.append(workReg->name());
-    //   }
+      for (i = 0; i < numWorkRegs; i++) {
+        RAWorkReg* workReg = workRegs[i];
+        if (i) sb.append(", ");
+        sb.append(workReg->name());
+      }
       sb.append('\n');
       logger->log(sb);
     });
   }
-
-  logger->log("....5\n");
 
   return kErrorOk;
 }
