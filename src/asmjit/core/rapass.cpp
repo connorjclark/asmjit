@@ -176,6 +176,11 @@ Error BaseRAPass::runOnFunction(Zone* zone, Logger* logger, FuncNode* func) {
 }
 
 Error BaseRAPass::onPerformAllSteps() noexcept {
+  makeUnavailable(RegGroup::kGp, 3);
+  makeUnavailable(RegGroup::kGp, 13);
+  makeUnavailable(RegGroup::kGp, 14);
+  makeUnavailable(RegGroup::kGp, 15);
+
   ASMJIT_PROPAGATE(buildCFG());
   ASMJIT_PROPAGATE(buildCFGViews());
   ASMJIT_PROPAGATE(removeUnreachableCode());
