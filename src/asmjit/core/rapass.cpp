@@ -1256,13 +1256,15 @@ ASMJIT_FAVOR_SPEED Error BaseRAPass::linearScan(RegGroup group) noexcept {
     }
   }
 
-  auto compareByEndWorkReg = [&](const RAWorkReg* a, const RAWorkReg* b) noexcept {
-    return reg_span_end[a->workId()] < reg_span_end[b->workId()];
+  auto compareByStartWorkReg = [&](const RAWorkReg* a, const RAWorkReg* b) noexcept {
+    return reg_span_start[a->workId()] < reg_span_start[b->workId()];
   };
-  auto compareByEndWorkId = [&](uint32_t a, uint32_t b) noexcept {
-    return reg_span_end[a] < reg_span_end[b];
+  auto compareByEndWorkId = [&](uint32_t a_idx, uint32_t b_idx) noexcept {
+    RAWorkReg* a_reg = workRegs[a_idx];
+    RAWorkReg* b_reg = workRegs[b_idx];
+    return reg_span_end[a_reg->workId()] < reg_span_end[b_reg->workId()];
   };
-  std::stable_sort(workRegs.begin(), workRegs.end(), compareByEndWorkReg);
+  std::stable_sort(workRegs.begin(), workRegs.end(), compareByStartWorkReg);
 
   RegMask availableRegs = _availableRegs[group];
   RegMask preservedRegs = func()->frame().preservedRegs(group);
@@ -1283,7 +1285,9 @@ ASMJIT_FAVOR_SPEED Error BaseRAPass::linearScan(RegGroup group) noexcept {
     //     add register[j] to pool of free registers
     uint32_t k = 0;
     for (uint32_t j : active) {
-      if (reg_span_end[j] >= reg_span_start[i])
+      RAWorkReg* currentReg = workRegs[i];
+      RAWorkReg* activeReg = workRegs[j];
+      if (reg_span_end[activeReg->workId()] >= reg_span_start[currentReg->workId()])
         break;
 
       k++;
@@ -1308,11 +1312,13 @@ ASMJIT_FAVOR_SPEED Error BaseRAPass::linearScan(RegGroup group) noexcept {
       //     add i to active, sorted by increasing end point
       // else
       //     location[i] ← new stack location
-      uint32_t spill = active.back();
-      if (reg_span_end[spill] > reg_span_end[i]) {
-        workRegs[i]->setHomeRegId(workRegs[spill]->homeRegId());
-        workRegs[spill]->markStackPreferred();
-        workRegs[spill]->setHomeRegId(BaseReg::kIdBad);
+      uint32_t spill_idx = active.back();
+      RAWorkReg* spillReg = workRegs[spill_idx];
+      RAWorkReg* currentReg = workRegs[i];
+      if (reg_span_end[spillReg->workId()] > reg_span_end[currentReg->workId()]) {
+        workRegs[i]->setHomeRegId(workRegs[spill_idx]->homeRegId());
+        workRegs[spill_idx]->markStackPreferred();
+        workRegs[spill_idx]->setHomeRegId(BaseReg::kIdBad);
         active.pop_back();
         active.insert(std::upper_bound(active.begin(), active.end(), i, compareByEndWorkId), i);
       } else {
