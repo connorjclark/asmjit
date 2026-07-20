@@ -620,6 +620,10 @@ void ARMRAPass::onInit() noexcept {
   makeUnavailable(RegGroup::kGp, Gp::kIdSp);
   makeUnavailable(RegGroup::kGp, Gp::kIdOs); // OS-specific use, usually TLS.
 
+  // (zc patch) x28 is reserved as a scratch register for addressing spill
+  // slots that are out of range of a scaled load/store; see _rewrite().
+  makeUnavailable(RegGroup::kGp, 28);
+
   _sp = sp;
   _fp = x29;
 }
@@ -713,9 +717,27 @@ ASMJIT_FAVOR_SPEED Error ARMRAPass::_rewrite(BaseNode* first, BaseNode* stop) no
             RAStackSlot* slot = workReg->stackSlot();
             int32_t offset = slot->offset();
 
-            mem._setBase(_sp.type(), slot->baseRegId());
-            mem.clearRegHome();
-            mem.addOffsetLo32(offset);
+            // (zc patch) A scaled 32-bit load/store can only address
+            // [sp, 0..16380]; larger spill frames previously failed with
+            // InvalidDisplacement at encode time. For offsets beyond the
+            // always-safe range, materialize the offset into x28 (reserved in
+            // onInit, never allocated) and use register-offset addressing.
+            if (uint32_t(offset) > 16380u) {
+              BaseNode* prevCursor = cc()->setCursor(node->prev());
+              Error err = cc()->as<Compiler>()->mov(GpX(28), offset);
+              cc()->_setCursor(prevCursor);
+              if (ASMJIT_UNLIKELY(err))
+                return err;
+
+              mem._setBase(_sp.type(), slot->baseRegId());
+              mem.clearRegHome();
+              mem.as<Mem>().setIndex(GpX(28));
+            }
+            else {
+              mem._setBase(_sp.type(), slot->baseRegId());
+              mem.clearRegHome();
+              mem.addOffsetLo32(offset);
+            }
           }
         }
       }
