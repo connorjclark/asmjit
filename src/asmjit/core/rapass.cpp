@@ -176,10 +176,15 @@ Error BaseRAPass::runOnFunction(Zone* zone, Logger* logger, FuncNode* func) {
 }
 
 Error BaseRAPass::onPerformAllSteps() noexcept {
-  makeUnavailable(RegGroup::kGp, 3);
-  makeUnavailable(RegGroup::kGp, 13);
-  makeUnavailable(RegGroup::kGp, 14);
-  makeUnavailable(RegGroup::kGp, 15);
+  // These exist for zc's x64 JIT backend, which pins rbx/r13/r14/r15 as
+  // physical registers outside the allocator's knowledge. The AArch64 backend
+  // pins nothing, so don't waste 4 allocatable registers there.
+  if (cc()->arch() == Arch::kX64) {
+    makeUnavailable(RegGroup::kGp, 3);
+    makeUnavailable(RegGroup::kGp, 13);
+    makeUnavailable(RegGroup::kGp, 14);
+    makeUnavailable(RegGroup::kGp, 15);
+  }
 
   ASMJIT_PROPAGATE(buildCFG());
   ASMJIT_PROPAGATE(buildCFGViews());
