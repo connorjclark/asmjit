@@ -72,6 +72,8 @@ static void BaseRAPass_reset(BaseRAPass* self, FuncDetail* funcDetail) noexcept 
   self->_createdBlockCount = 0;
 
   self->_sharedAssignments.reset();
+  self->_workRegToLiveId.reset();
+  self->_liveIdToWorkId.reset();
   self->_lastTimestamp = 0;
 
   self->_archTraits = nullptr;
@@ -826,7 +828,6 @@ ASMJIT_FAVOR_SPEED Error BaseRAPass::buildLiveness() noexcept {
   uint32_t numReachableBlocks = reachableBlockCount();
 
   uint32_t numWorkRegs = workRegCount();
-  uint32_t numBitWords = ZoneBitVector::_wordsPerBits(numWorkRegs);
 
   if (!numWorkRegs) {
     ASMJIT_RA_LOG_FORMAT("  Done (no virtual registers)\n");
@@ -841,12 +842,138 @@ ASMJIT_FAVOR_SPEED Error BaseRAPass::buildLiveness() noexcept {
   ASMJIT_PROPAGATE(nOutsPerWorkReg.resize(allocator(), numWorkRegs));
   ASMJIT_PROPAGATE(nInstsPerBlock.resize(allocator(), numAllBlocks));
 
+  // (zc patch) Build the liveness universe
+  // ---------------------------------------
+  //
+  // Upstream sizes the IN/OUT/GEN/KILL bit-vectors of every block to the number of work registers,
+  // so liveness costs blocks * workRegs / 2 bytes. A code generator that creates a fresh virtual
+  // register for every temporary (like zc's script jit) produces functions where only a few percent
+  // of the registers are ever referenced outside of one basic block, and the bit-vectors dominate
+  // compilation memory: a 58k-instruction script function had 29k blocks and 124k registers, which
+  // is 1.7 GB of bit-vectors, while just 9.3k of its registers were live across any block.
+  //
+  // A register referenced in a single block B is only ever live-in/out somewhere if B reads it
+  // before writing it (GEN && !KILL in B, an upward-exposed use): then it is live-in to B and flows
+  // to B's predecessors, which is how function arguments reach the entry block. Every other
+  // single-block register has IN = OUT = 0 in every block, so leaving it out of the bit-vectors
+  // changes nothing. The walk below replays the GEN/KILL state machine of the block walk with one
+  // byte per register to classify the registers, and computes the KILL/LAST flags of the tied
+  // registers from it (upstream derived them from the GEN/KILL bits). The registers that stay in
+  // the universe then get dense "live ids", and everything that indexes a liveness bit-vector goes
+  // through `_workRegToLiveId` / `_liveIdToWorkId`.
+
+  enum : uint8_t {
+    kStateGen = 0x01,
+    kStateKill = 0x02
+  };
+
+  ZoneVector<uint8_t> regState;       // GEN/KILL state of each register within the block being walked.
+  ZoneVector<uint32_t> regStateBlock; // Block `regState` belongs to (kUnassignedId - not referenced yet).
+  ZoneVector<uint8_t> regMultiBlock;  // Non-zero if referenced in more than one block.
+
+  ASMJIT_PROPAGATE(regState.resize(allocator(), numWorkRegs));
+  ASMJIT_PROPAGATE(regStateBlock.resize(allocator(), numWorkRegs));
+  ASMJIT_PROPAGATE(regMultiBlock.resize(allocator(), numWorkRegs));
+
+  for (i = 0; i < numWorkRegs; i++)
+    regStateBlock[i] = RABlock::kUnassignedId;
+
+  for (i = 0; i < numReachableBlocks; i++) {
+    RABlock* block = _pov[i];
+    uint32_t blockId = block->blockId();
+
+    BaseNode* node = block->last();
+    BaseNode* stop = block->first();
+
+    for (;;) {
+      if (node->isInst()) {
+        InstNode* inst = node->as<InstNode>();
+        RAInst* raInst = inst->passData<RAInst>();
+        ASMJIT_ASSERT(raInst != nullptr);
+
+        RATiedReg* tiedRegs = raInst->tiedRegs();
+        uint32_t count = raInst->tiedCount();
+
+        for (uint32_t j = 0; j < count; j++) {
+          RATiedReg* tiedReg = &tiedRegs[j];
+          uint32_t workId = tiedReg->workId();
+
+          uint8_t state = regState[workId];
+          if (regStateBlock[workId] != blockId) {
+            // First reference in this block. The GEN/KILL bits start cleared in every block, so the
+            // state starts over; a register already referenced in another block is multi-block.
+            if (regStateBlock[workId] != RABlock::kUnassignedId)
+              regMultiBlock[workId] = 1;
+            regStateBlock[workId] = blockId;
+            state = 0;
+          }
+
+          // Mark as:
+          //   KILL - if this VirtReg is killed afterwards.
+          //   LAST - if this VirtReg is last in this basic block.
+          if (state & kStateKill)
+            tiedReg->addFlags(RATiedFlags::kKill);
+          else if (!(state & kStateGen))
+            tiedReg->addFlags(RATiedFlags::kLast);
+
+          if (tiedReg->isWriteOnly()) {
+            // KILL.
+            state |= kStateKill;
+          }
+          else {
+            // GEN.
+            state = uint8_t((state & ~kStateKill) | kStateGen);
+          }
+
+          regState[workId] = state;
+        }
+      }
+
+      if (node == stop)
+        break;
+
+      node = node->prev();
+      ASMJIT_ASSERT(node != nullptr);
+    }
+  }
+
+  ASMJIT_PROPAGATE(_workRegToLiveId.resize(allocator(), numWorkRegs));
+
+  uint32_t numLiveRegs = 0;
+  for (i = 0; i < numWorkRegs; i++) {
+    bool referenced = regStateBlock[i] != RABlock::kUnassignedId;
+    uint8_t state = regState[i];
+
+    // In the universe: multi-block, or single-block with an upward-exposed use (see above).
+    bool inUniverse = regMultiBlock[i] || (referenced && (state & (kStateGen | kStateKill)) == kStateGen);
+    _workRegToLiveId[i] = inUniverse ? numLiveRegs++ : Globals::kInvalidId;
+
+    // Single-block registers that are written and then read in their block. Upstream marks these
+    // while walking each block's GEN bits below, which no longer sees them.
+    if (!inUniverse && referenced && (state & (kStateGen | kStateKill)) == (kStateGen | kStateKill))
+      _workRegs[i]->setSingleBlockId(regStateBlock[i]);
+  }
+
+  ASMJIT_PROPAGATE(_liveIdToWorkId.resize(allocator(), numLiveRegs));
+  for (i = 0; i < numWorkRegs; i++) {
+    uint32_t liveId = _workRegToLiveId[i];
+    if (liveId != Globals::kInvalidId)
+      _liveIdToWorkId[liveId] = i;
+  }
+
+  regState.release(allocator());
+  regStateBlock.release(allocator());
+  regMultiBlock.release(allocator());
+
+  uint32_t numBitWords = ZoneBitVector::_wordsPerBits(numLiveRegs);
+  ASMJIT_RA_LOG_FORMAT("  Liveness universe: %u of %u work registers\n", numLiveRegs, numWorkRegs);
+
   // Calculate GEN/KILL of Each Block
   // --------------------------------
 
   for (i = 0; i < numReachableBlocks; i++) {
     RABlock* block = _pov[i];
-    ASMJIT_PROPAGATE(block->resizeLiveBits(numWorkRegs));
+    ASMJIT_PROPAGATE(block->resizeLiveBits(numLiveRegs));
 
     BaseNode* node = block->last();
     BaseNode* stop = block->first();
@@ -869,22 +996,19 @@ ASMJIT_FAVOR_SPEED Error BaseRAPass::buildLiveness() noexcept {
           nUsesPerWorkReg[workId] += 1u;
           nOutsPerWorkReg[workId] += uint32_t(tiedReg->isWrite());
 
-          // Mark as:
-          //   KILL - if this VirtReg is killed afterwards.
-          //   LAST - if this VirtReg is last in this basic block.
-          if (block->kill().bitAt(workId))
-            tiedReg->addFlags(RATiedFlags::kKill);
-          else if (!block->gen().bitAt(workId))
-            tiedReg->addFlags(RATiedFlags::kLast);
-
-          if (tiedReg->isWriteOnly()) {
-            // KILL.
-            block->kill().setBit(workId, true);
-          }
-          else {
-            // GEN.
-            block->kill().setBit(workId, false);
-            block->gen().setBit(workId, true);
+          // (zc patch) The KILL/LAST flags of `tiedReg` were computed while building the liveness
+          // universe above; only the registers in the universe have GEN/KILL bits.
+          uint32_t liveId = _workRegToLiveId[workId];
+          if (liveId != Globals::kInvalidId) {
+            if (tiedReg->isWriteOnly()) {
+              // KILL.
+              block->kill().setBit(liveId, true);
+            }
+            else {
+              // GEN.
+              block->kill().setBit(liveId, false);
+              block->gen().setBit(liveId, true);
+            }
           }
 
           if (tiedReg->isLeadConsecutive()) {
@@ -1001,7 +1125,7 @@ ASMJIT_FAVOR_SPEED Error BaseRAPass::buildLiveness() noexcept {
     {
       ZoneBitVector::ForEachBitSet it(block->liveIn());
       while (it.hasNext()) {
-        RAWorkReg* workReg = _workRegs[uint32_t(it.next())];
+        RAWorkReg* workReg = workRegByLiveId(uint32_t(it.next()));
         curLiveCount[workReg->group()]++;
         ASMJIT_PROPAGATE(workReg->liveSpans().openAt(allocator(), position, endPosition));
       }
@@ -1011,9 +1135,9 @@ ASMJIT_FAVOR_SPEED Error BaseRAPass::buildLiveness() noexcept {
     {
       ZoneBitVector::ForEachBitSet it(block->gen());
       while (it.hasNext()) {
-        uint32_t id = uint32_t(it.next());
-        if (block->kill().bitAt(id)) {
-          RAWorkReg* workReg = _workRegs[id];
+        uint32_t liveId = uint32_t(it.next());
+        if (block->kill().bitAt(liveId)) {
+          RAWorkReg* workReg = workRegByLiveId(liveId);
           workReg->setSingleBlockId(block->blockId());
         }
       }
@@ -1044,7 +1168,7 @@ ASMJIT_FAVOR_SPEED Error BaseRAPass::buildLiveness() noexcept {
           // We couldn't calculate this in previous steps, but since we know all LIVE-OUT at this point it becomes
           // trivial. If this is the last instruction that uses this `workReg` and it's not LIVE-OUT then it is
           // KILLed here.
-          if (tiedReg->isLast() && !block->liveOut().bitAt(workId))
+          if (tiedReg->isLast() && !isLiveBit(block->liveOut(), workId))
             tiedReg->addFlags(RATiedFlags::kKill);
 
           LiveRegSpans& liveSpans = workReg->liveSpans();
@@ -1155,7 +1279,7 @@ Error BaseRAPass::assignArgIndexToWorkRegs() noexcept {
 
       // Overwritten argument.
       uint32_t workId = workReg->workId();
-      if (!liveIn.bitAt(workId))
+      if (!isLiveBit(liveIn, workId))
         continue;
 
       workReg->setArgIndex(argIndex, valueIndex);
@@ -1768,7 +1892,7 @@ Error BaseRAPass::setBlockEntryAssignment(RABlock* block, const RABlock* fromBlo
   {
     ZoneBitVector::ForEachBitOp<Support::AndNot> it(liveOut, liveIn);
     while (it.hasNext()) {
-      uint32_t workId = uint32_t(it.next());
+      uint32_t workId = _liveIdToWorkId[uint32_t(it.next())];
       RAWorkReg* workReg = workRegById(workId);
 
       RegGroup group = workReg->group();
@@ -1792,7 +1916,7 @@ Error BaseRAPass::setSharedAssignment(uint32_t sharedAssignmentId, const RAAssig
   _sharedAssignments[sharedAssignmentId].assignPhysToWorkMap(physToWorkMap);
 
   ZoneBitVector& sharedLiveIn = _sharedAssignments[sharedAssignmentId]._liveIn;
-  ASMJIT_PROPAGATE(sharedLiveIn.resize(allocator(), workRegCount()));
+  ASMJIT_PROPAGATE(sharedLiveIn.resize(allocator(), liveRegCount()));
 
   Support::Array<uint32_t, Globals::kNumVirtGroups> sharedAssigned {};
   for (RABlock* block : blocks()) {
@@ -1818,7 +1942,7 @@ Error BaseRAPass::setSharedAssignment(uint32_t sharedAssignmentId, const RAAssig
           uint32_t physId = it.next();
           uint32_t workId = entryPhysToWorkMap->workIds[physBaseIndex + physId];
 
-          if (!liveIn.bitAt(workId))
+          if (!isLiveBit(liveIn, workId))
             entryPhysToWorkMap->unassign(group, physId, physBaseIndex + physId);
         }
       }
@@ -2154,12 +2278,12 @@ ASMJIT_FAVOR_SIZE Error BaseRAPass::_dumpBlockLiveness(String& sb, const RABlock
 
     const ZoneBitVector& bits = block->_liveBits[liveType];
     uint32_t size = bits.size();
-    ASMJIT_ASSERT(size <= workRegCount());
+    ASMJIT_ASSERT(size <= liveRegCount());
 
     uint32_t n = 0;
-    for (uint32_t workId = 0; workId < size; workId++) {
-      if (bits.bitAt(workId)) {
-        RAWorkReg* wReg = workRegById(workId);
+    for (uint32_t liveId = 0; liveId < size; liveId++) {
+      if (bits.bitAt(liveId)) {
+        RAWorkReg* wReg = workRegByLiveId(liveId);
 
         if (!n)
           sb.appendFormat("    %s [", bitsName);

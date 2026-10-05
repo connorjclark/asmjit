@@ -697,6 +697,14 @@ public:
   //! Shared assignment blocks.
   ZoneVector<RASharedAssignment> _sharedAssignments {};
 
+  //! (zc patch) Liveness universe: for each work register, its index into the per-block liveness
+  //! bit-vectors (IN/OUT/GEN/KILL and a shared assignment's live-in), or `Globals::kInvalidId` when
+  //! the register can never be live across a block boundary and is left out of them. Built by
+  //! `buildLiveness()`, see the comment there.
+  ZoneVector<uint32_t> _workRegToLiveId {};
+  //! (zc patch) Inverse of `_workRegToLiveId` - the work id of each live id.
+  ZoneVector<uint32_t> _liveIdToWorkId {};
+
   //! Timestamp generator (incremental).
   mutable uint64_t _lastTimestamp = 0;
 
@@ -1018,6 +1026,17 @@ public:
 
   ASMJIT_INLINE_NODEBUG uint32_t workRegCount() const noexcept { return _workRegs.size(); }
   ASMJIT_INLINE_NODEBUG uint32_t workRegCount(RegGroup group) const noexcept { return _workRegsOfGroup[group].size(); }
+
+  //! (zc patch) Returns the number of registers in the liveness universe - the size of every liveness bit-vector.
+  ASMJIT_INLINE_NODEBUG uint32_t liveRegCount() const noexcept { return _liveIdToWorkId.size(); }
+  //! (zc patch) Returns the work register a liveness bit-vector index refers to.
+  ASMJIT_INLINE_NODEBUG RAWorkReg* workRegByLiveId(uint32_t liveId) const noexcept { return _workRegs[_liveIdToWorkId[liveId]]; }
+  //! (zc patch) Tests the bit of `workId` in a liveness bit-vector. Registers outside the liveness
+  //! universe are never live across blocks, so they always test false.
+  ASMJIT_INLINE_NODEBUG bool isLiveBit(const ZoneBitVector& bits, uint32_t workId) const noexcept {
+    uint32_t liveId = _workRegToLiveId[workId];
+    return liveId != Globals::kInvalidId && bits.bitAt(liveId);
+  }
 
   inline void _buildPhysIndex() noexcept {
     _physRegIndex.buildIndexes(_physRegCount);
