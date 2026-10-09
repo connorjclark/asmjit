@@ -57,6 +57,7 @@ public:
 
   void onInit() noexcept override;
   void onDone() noexcept override;
+  void onLocalStackSized(FuncFrame& frame) noexcept override;
 
   //! \}
 

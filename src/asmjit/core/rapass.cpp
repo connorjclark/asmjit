@@ -217,6 +217,7 @@ Error BaseRAPass::onPerformAllSteps() noexcept {
 
 void BaseRAPass::onInit() noexcept {}
 void BaseRAPass::onDone() noexcept {}
+void BaseRAPass::onLocalStackSized(FuncFrame& frame) noexcept { DebugUtils::unused(frame); }
 
 // BaseRAPass - CFG - Basic Block Management
 // =========================================
@@ -2027,6 +2028,7 @@ Error BaseRAPass::updateStackFrame() noexcept {
   // Calculate offsets of all stack slots and update StackSize to reflect the calculated local stack size.
   ASMJIT_PROPAGATE(_stackAllocator.calculateStackFrame());
   frame.setLocalStackSize(_stackAllocator.stackSize());
+  onLocalStackSized(frame);
 
   // Update the stack frame based on `_argsAssignment` and finalize it. Finalization means to apply final calculation
   // to the stack layout.

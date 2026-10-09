@@ -832,6 +832,10 @@ public:
   //! up. Called even if the register allocation failed.
   virtual void onDone() noexcept;
 
+  //! (zc patch) Called by \ref updateStackFrame() once the local stack size is known, before the
+  //! frame is finalized, so a backend can still mark registers its rewrite will need as dirty.
+  virtual void onLocalStackSized(FuncFrame& frame) noexcept;
+
   //! \}
 
   //! \name CFG - Basic-Block Management

@@ -630,6 +630,14 @@ void ARMRAPass::onInit() noexcept {
 
 void ARMRAPass::onDone() noexcept {}
 
+// (zc patch) _rewrite() addresses spill slots past [sp, 16380] through x28, which the AAPCS64
+// makes callee-saved, so a function whose spill slots may reach that far must save and restore it.
+// Slots sit past the call stack area (aligned up to the stack alignment, which is at most 64).
+void ARMRAPass::onLocalStackSized(FuncFrame& frame) noexcept {
+  if (uint64_t(frame.callStackSize()) + 64u + frame.localStackSize() > 16380u)
+    frame.addDirtyRegs(RegGroup::kGp, Support::bitMask(28));
+}
+
 // a64::ARMRAPass - BuildCFG
 // =========================
 

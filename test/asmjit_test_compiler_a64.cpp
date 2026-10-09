@@ -669,12 +669,92 @@ public:
   }
 };
 
+// a64::Compiler - A64Test_BigSpillFrame
+// =====================================
+
+// (zc patch) Functions whose spill slots reach past [sp, 16380] address them through x28, which the
+// prologue must then save and restore because the AAPCS64 makes it callee-saved. The caller keeps a
+// sentinel in x28 across the call and checks it survived.
+class A64Test_BigSpillFrame : public A64TestCase {
+public:
+  uint32_t _regCount;
+
+  A64Test_BigSpillFrame(uint32_t n)
+    : A64TestCase(),
+      _regCount(n) {
+    _name.assignFormat("BigSpillFrame {NumRegs=%u}", n);
+  }
+
+  static void add(TestApp& app) {
+    // 32-bit slots: ~16000 bytes (in range), ~16800 bytes (just past), ~32000 bytes.
+    app.add(new A64Test_BigSpillFrame(4000));
+    app.add(new A64Test_BigSpillFrame(4200));
+    app.add(new A64Test_BigSpillFrame(8000));
+  }
+
+  virtual void compile(a64::Compiler& cc) {
+    cc.addFunc(FuncSignature::build<int>());
+
+    a64::Gp* regs = static_cast<a64::Gp*>(malloc(_regCount * sizeof(a64::Gp)));
+
+    for (uint32_t i = 0; i < _regCount; i++) {
+      regs[i] = cc.newUInt32("reg%u", i);
+      cc.mov(regs[i], i + 1);
+    }
+
+    a64::Gp sum = cc.newUInt32("sum");
+    cc.mov(sum, 0);
+
+    for (uint32_t i = 0; i < _regCount; i++) {
+      cc.add(sum, sum, regs[i]);
+    }
+
+    cc.ret(sum);
+    cc.endFunc();
+
+    free(regs);
+  }
+
+  virtual bool run(void* _func, String& result, String& expect) {
+    typedef int (*Func)(void);
+    Func func = ptr_as_func<Func>(_func);
+
+    const uint64_t sentinel = 0x1234567890ABCDEFu;
+    uint64_t x28 = sentinel;
+    int ret;
+
+#if defined(__GNUC__) && (defined(__aarch64__) || defined(_M_ARM64))
+    asm volatile(
+      "mov x28, %[x28]\n\t"
+      "blr %[fn]\n\t"
+      "mov %w[ret], w0\n\t"
+      "mov %[x28], x28\n\t"
+      : [x28]"+r"(x28), [ret]"=r"(ret)
+      : [fn]"r"(func)
+      : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+        "x16", "x17", "x28", "x30", "memory", "cc");
+#else
+    ret = func();
+#endif
+
+    result.assignFormat("ret={%d} x28Preserved={%d}", ret, int(x28 == sentinel));
+    expect.assignFormat("ret={%d} x28Preserved={%d}", calcSum(), 1);
+
+    return result == expect;
+  }
+
+  uint32_t calcSum() const {
+    return (_regCount | 1) * ((_regCount + 1) / 2);
+  }
+};
+
 // a64::Compiler - Export
 // ======================
 
 void compiler_add_a64_tests(TestApp& app) {
   app.addT<A64Test_GpArgs>();
   app.addT<A64Test_ManyRegs>();
+  app.addT<A64Test_BigSpillFrame>();
   app.addT<A64Test_Simd1>();
   app.addT<A64Test_Adr>();
   app.addT<A64Test_Branch1>();
