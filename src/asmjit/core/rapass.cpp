@@ -1934,8 +1934,6 @@ Error BaseRAPass::setSharedAssignment(uint32_t sharedAssignmentId, const RAAssig
       sharedLiveIn.or_(liveIn);
 
       for (RegGroup group : RegGroupVirtValues{}) {
-        sharedAssigned[group] |= entryPhysToWorkMap->assigned[group];
-
         uint32_t physBaseIndex = _physRegIndex.get(group);
         Support::BitWordIterator<RegMask> it(entryPhysToWorkMap->assigned[group]);
 
@@ -1946,6 +1944,13 @@ Error BaseRAPass::setSharedAssignment(uint32_t sharedAssignmentId, const RAAssig
           if (!isLiveBit(liveIn, workId))
             entryPhysToWorkMap->unassign(group, physId, physBaseIndex + physId);
         }
+
+        // (zc patch) Collect what stays assigned after the LIVE-IN filter above. Upstream collected it
+        // before the filter, so the loop below never unassigned anything and the shared assignment kept
+        // registers that are live into none of its blocks. `switchToAssignment()` never loads such a
+        // register (it is not in the shared LIVE-IN), so a later switch to the shared assignment (from
+        // a jump table) could not reproduce it and failed its `dst.equals(cur)` assertion.
+        sharedAssigned[group] |= entryPhysToWorkMap->assigned[group];
       }
     }
   }

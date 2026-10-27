@@ -669,6 +669,83 @@ public:
   }
 };
 
+// a64::Compiler - A64Test_JumpTableSharedDead
+// ===========================================
+
+class A64Test_JumpTableSharedDead : public A64TestCase {
+public:
+  A64Test_JumpTableSharedDead()
+    : A64TestCase("JumpTable {Shared Assignment Seeded From A Direct Branch}") {}
+
+  static void add(TestApp& app) {
+    app.add(new A64Test_JumpTableSharedDead());
+  }
+
+  virtual void compile(a64::Compiler& cc) {
+    FuncNode* funcNode = cc.addFunc(FuncSignature::build<int, uint32_t>());
+
+    a64::Gp sel = cc.newUInt32("sel");
+    a64::Gp result = cc.newUInt32("result");
+    a64::Gp target = cc.newIntPtr("target");
+    a64::Gp offset = cc.newIntPtr("offset");
+
+    Label L_Table = cc.newLabel();
+    Label L_Case0 = cc.newLabel();
+    Label L_Case1 = cc.newLabel();
+    Label L_End = cc.newLabel();
+
+    funcNode->setArg(0, sel);
+
+    // A direct branch into a jump table target. The shared assignment of the targets is seeded from this edge,
+    // where `sel` is still assigned (the jump table below reads it) but live into none of the targets. The jump
+    // table itself reaches the shared assignment with `sel` already released, so the two must agree on it.
+    cc.cbz(sel, L_Case0);
+
+    cc.adr(target, L_Table);
+    cc.ldrsw(offset, a64::ptr(target, sel, a64::sxtw(2)));
+    cc.add(target, target, offset);
+
+    JumpAnnotation* annotation = cc.newJumpAnnotation();
+    annotation->addLabel(L_Case0);
+    annotation->addLabel(L_Case1);
+    cc.br(target, annotation);
+
+    cc.bind(L_Case0);
+    cc.mov(result, 10);
+    cc.b(L_End);
+
+    cc.bind(L_Case1);
+    cc.mov(result, 11);
+
+    cc.bind(L_End);
+    cc.ret(result);
+    cc.endFunc();
+
+    cc.bind(L_Table);
+    cc.embedLabelDelta(L_Case0, L_Table, 4);
+    cc.embedLabelDelta(L_Case1, L_Table, 4);
+  }
+
+  virtual bool run(void* _func, String& result, String& expect) {
+    typedef int (*Func)(uint32_t);
+    Func func = ptr_as_func<Func>(_func);
+
+    int dst[2];
+    int ref[2];
+
+    dst[0] = func(0);
+    dst[1] = func(1);
+
+    ref[0] = 10;
+    ref[1] = 11;
+
+    result.assignFormat("ret={%d, %d}", dst[0], dst[1]);
+    expect.assignFormat("ret={%d, %d}", ref[0], ref[1]);
+
+    return result == expect;
+  }
+};
+
 // a64::Compiler - A64Test_BigSpillFrame
 // =====================================
 
@@ -762,6 +839,7 @@ void compiler_add_a64_tests(TestApp& app) {
   app.addT<A64Test_Invoke2>();
   app.addT<A64Test_Invoke3>();
   app.addT<A64Test_JumpTable>();
+  app.addT<A64Test_JumpTableSharedDead>();
 }
 
 #endif // !ASMJIT_NO_COMPILER && !ASMJIT_NO_AARCH64
